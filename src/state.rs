@@ -5,12 +5,19 @@ use std::sync::atomic::AtomicUsize;
 use crossbeam_queue::ArrayQueue;
 use nvml_wrapper::Nvml;
 
+#[derive(Clone)]
 pub struct WorkerState {
     /// High-performance queue of Session instances.
     /// Acts as a 'pool' of parallel inference lanes.
     pub pool: Arc<ArrayQueue<Arc<Mutex<Session>>>>,
     /// Counter for debug image captures
     pub debug_capture_count: Arc<AtomicUsize>,
+    /// Total number of parallel sessions initialized
+    pub pool_size: usize,
+    /// Total GPU VRAM detected in MB
+    pub total_vram_mb: u64,
+    /// Number of active RTSP streams being processed
+    pub active_streams: Arc<AtomicUsize>,
 }
 
 impl WorkerState {
@@ -19,8 +26,13 @@ impl WorkerState {
         println!("🚀 HARDWARE DIAGNOSTICS: INITIALIZING GPU POOL");
         println!("--------------------------------------------------");
 
+        let nvml = Nvml::init().expect("Failed to initialize NVML");
+        let device = nvml.device_by_index(0).expect("Failed to get GPU device");
+        let mem = device.memory_info().expect("Failed to get memory info");
+        let total_vram_mb = mem.total / 1024 / 1024;
+
         // 1. Detect VRAM using NVML
-        let pool_size = match Self::calculate_pool_size() {
+        let pool_size = match Self::calculate_pool_size(&device) {
             Ok(size) => {
                 println!("[GPU Check] Available VRAM detected. Initializing {} parallel lanes.", size);
                 size
@@ -54,12 +66,13 @@ impl WorkerState {
         Self {
             pool: Arc::new(pool),
             debug_capture_count: Arc::new(AtomicUsize::new(0)),
+            pool_size,
+            total_vram_mb,
+            active_streams: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    fn calculate_pool_size() -> Result<usize, Box<dyn std::error::Error>> {
-        let nvml = Nvml::init()?;
-        let device = nvml.device_by_index(0)?;
+    fn calculate_pool_size(device: &nvml_wrapper::Device) -> Result<usize, Box<dyn std::error::Error>> {
         let name = device.name()?;
         let mem = device.memory_info()?;
         
@@ -86,7 +99,7 @@ impl WorkerState {
     }
 
     fn create_session() -> Session {
-        let mut builder = Session::builder()
+        let builder = Session::builder()
             .expect("Failed to create SessionBuilder")
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .expect("Failed to set optimization level")

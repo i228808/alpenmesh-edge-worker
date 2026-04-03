@@ -66,7 +66,7 @@ impl ExecuteController {
             .mapv(|v| v as f32 / 255.0)
             .permuted_axes([2, 0, 1])
             .insert_axis(ndarray::Axis(0))
-            .to_owned();
+            .into_dyn();
 
         // 3. Inference & I/O Binding
         let input_tensor = match ort::value::Value::from_array(input) {

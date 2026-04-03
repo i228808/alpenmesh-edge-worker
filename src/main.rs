@@ -3,6 +3,7 @@ mod controllers;
 mod heartbeat;
 mod state;
 mod inference;
+mod streams;
 
 use crate::state::WorkerState;
 
@@ -18,19 +19,20 @@ fn main() {
         }
     }
 
-    // Initialize background tokio task for heartbeat
-    heartbeat::start_heartbeat_task();
-
-    // Initialize GPU inference state (with hardware check)
+    // 1. Initialize GPU inference state (with hardware check)
     let state = WorkerState::new();
 
+    // 2. Initialize background tokio task for heartbeat with telemetry
+    heartbeat::start_heartbeat_task(state.clone());
+
     println!("--------------------------------------------------");
-    println!("🚀 OXIDE WORKER STARTING");
+    println!("🚀 OXIDE WORKER STARTING: SPECS-AWARE NATIVE INGESTION");
     println!("--------------------------------------------------");
 
     App::new()
         .config("app.yaml")
         .state(state)
         .controller::<controllers::ExecuteController>()
+        .controller::<controllers::StreamController>()
         .run();
 }
