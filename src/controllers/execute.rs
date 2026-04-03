@@ -1,9 +1,10 @@
 use oxide_framework_core::{controller, ApiResponse, AppState, Data};
-use axum::body::Bytes;
+use axum::extract::Multipart;
 use std::time::Instant;
 use tracing::info;
 
 use crate::state::WorkerState;
+use crate::inference::RoiMap;
 
 pub struct ExecuteController;
 
@@ -18,24 +19,75 @@ impl ExecuteController {
         &self,
         Data(state): Data<WorkerState>,
         headers: axum::http::HeaderMap,
-        body: Bytes,
+        mut multipart: Multipart,
     ) -> ApiResponse<serde_json::Value> {
         let camera_id = headers
             .get("X-Camera-ID")
             .and_then(|h| h.to_str().ok())
             .unwrap_or("unknown");
 
-        if body.is_empty() {
+        let mut frame_bytes: Vec<u8> = Vec::new();
+        let mut camera_name = camera_id.to_string();
+        let mut parsed_rois: RoiMap = RoiMap::new();
+
+        loop {
+            match multipart.next_field().await {
+                Ok(Some(field)) => {
+                    let name = field.name().unwrap_or("").to_string();
+                    if name == "frame" {
+                        match field.bytes().await {
+                            Ok(bytes) => frame_bytes = bytes.to_vec(),
+                            Err(_) => {
+                                return ApiResponse::error(oxide_framework_core::StatusCode::BAD_REQUEST, "Invalid frame field")
+                            }
+                        }
+                    } else if name == "camera_name" {
+                        if let Ok(text) = field.text().await {
+                            if !text.trim().is_empty() {
+                                camera_name = text;
+                            }
+                        }
+                    } else if name == "rois" {
+                        if let Ok(text) = field.text().await {
+                            if let Ok(map) = serde_json::from_str::<RoiMap>(&text) {
+                                parsed_rois = map;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return ApiResponse::error(oxide_framework_core::StatusCode::BAD_REQUEST, "Invalid multipart payload")
+                }
+            }
+        }
+
+        if frame_bytes.is_empty() {
             return ApiResponse::error(oxide_framework_core::StatusCode::BAD_REQUEST, "Empty body");
         }
 
-        let frame_bytes = body.to_vec();
+        if parsed_rois.is_empty() {
+            let rois = state.stream_rois.read().unwrap();
+            if let Some(map) = rois.get(&camera_name) {
+                parsed_rois = map.clone();
+            } else if let Some(map) = rois.get(camera_id) {
+                parsed_rois = map.clone();
+            }
+        }
+
         let start = Instant::now();
 
         // 1. High-Speed Native Pre-processing (zune-jpeg + fast-image-resize)
         let mut decoder = zune_jpeg::JpegDecoder::new(&frame_bytes);
         let pixels = decoder.decode().expect("Failed to decode JPEG");
         let info = decoder.info().unwrap();
+        let original_w = info.width as u32;
+        let original_h = info.height as u32;
+
+        let original_rgb = match image::load_from_memory(&frame_bytes) {
+            Ok(img) => img.to_rgb8(),
+            Err(_) => image::RgbImage::new(original_w.max(1), original_h.max(1)),
+        };
         
         use fast_image_resize as fr;
         use std::num::NonZeroU32;
@@ -114,7 +166,7 @@ impl ExecuteController {
             let count = debug_count + 1;
             
             tokio::spawn(async move {
-                if let Ok(mut img) = image::load_from_memory(&raw_bytes) {
+                if let Ok(img) = image::load_from_memory(&raw_bytes) {
                     let mut img = img.to_rgb8();
                     let (w, h) = img.dimensions();
                     
@@ -141,11 +193,26 @@ impl ExecuteController {
             });
         }
 
-        info!("[{}] Peak Inference completed in {}ms. Found {} detections.", camera_id, duration.as_millis(), final_boxes.len());
+        let vehicle_counts = crate::inference::compute_roi_vehicle_counts(
+            &final_boxes,
+            &parsed_rois,
+            original_w.max(1),
+            original_h.max(1),
+        );
+        let congestion_levels = crate::inference::compute_congestion_levels(&vehicle_counts);
+        let total_vehicles: u32 = vehicle_counts.values().copied().sum();
+        let traffic_lights = crate::inference::detect_traffic_light_state(&original_rgb, &parsed_rois);
+
+        info!("[{}] Peak Inference completed in {}ms. Found {} detections.", camera_name, duration.as_millis(), final_boxes.len());
         
         ApiResponse::ok(serde_json::json!({
+            "camera_name": camera_name,
             "detections": final_boxes,
-            "latency": duration.as_millis()
+            "latency": duration.as_millis(),
+            "vehicle_counts": vehicle_counts,
+            "congestion_levels": congestion_levels,
+            "total_vehicles": total_vehicles,
+            "traffic_lights": traffic_lights
         }))
     }
 }
