@@ -3,6 +3,11 @@ use std::collections::HashMap;
 
 pub type RoiMap = HashMap<String, Vec<[i32; 2]>>;
 
+const CLASS_CAR: i32 = 2;
+const CLASS_MOTORCYCLE: i32 = 3;
+const CLASS_TRUCK: i32 = 7;
+const CLASS_TRAFFIC_LIGHT: i32 = 9;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TrafficLightMetric {
     pub color: String,
@@ -11,27 +16,29 @@ pub struct TrafficLightMetric {
 }
 
 pub fn decode_output(raw_data: &[f32]) -> Vec<[f32; 6]> {
-    // Pre-allocate space for results to avoid resizing the Vec in the loop
     let mut results = Vec::with_capacity(50);
     let num_anchors = 8400;
+    let classes = [
+        CLASS_CAR,
+        CLASS_MOTORCYCLE,
+        CLASS_TRUCK,
+        CLASS_TRAFFIC_LIGHT,
+    ];
 
     for col in 0..num_anchors {
-        // Directly check car (2) and bus (5) scores ONLY
-        // In YOLOv8 [1, 84, 8400], rows 4-83 are class scores.
-        // Row 4+2=6 is Car, Row 4+5=9 is Bus.
-        let car_score = raw_data[6 * num_anchors + col];
-        let bus_score = raw_data[9 * num_anchors + col];
+        let mut best_score = 0.0f32;
+        let mut best_class = -1i32;
 
-        let max_score = if car_score > bus_score {
-            car_score
-        } else {
-            bus_score
-        };
+        for class_id in classes {
+            let score_idx = (4 + class_id as usize) * num_anchors + col;
+            let score = raw_data[score_idx];
+            if score > best_score {
+                best_score = score;
+                best_class = class_id;
+            }
+        }
 
-        if max_score > 0.50 {
-            // Slightly higher threshold to prune faster
-            let best_class = if car_score > bus_score { 2.0 } else { 5.0 };
-
+        if best_score > 0.50 && best_class >= 0 {
             let cx = raw_data[0 * num_anchors + col];
             let cy = raw_data[1 * num_anchors + col];
             let w = raw_data[2 * num_anchors + col];
@@ -43,7 +50,7 @@ pub fn decode_output(raw_data: &[f32]) -> Vec<[f32; 6]> {
             let x2 = cx + w / 2.0;
             let y2 = cy + h / 2.0;
 
-            results.push([x1, y1, x2, y2, max_score, best_class]);
+            results.push([x1, y1, x2, y2, best_score, best_class as f32]);
         }
     }
 
@@ -65,6 +72,10 @@ pub fn compute_roi_vehicle_counts(
     roi_keys.sort();
 
     for det in detections {
+        if !is_vehicle_class(det[5] as i32) {
+            continue;
+        }
+
         let cx = ((det[0] + det[2]) * 0.5) * original_w as f32 / 640.0;
         let cy = ((det[1] + det[3]) * 0.5) * original_h as f32 / 640.0;
 
@@ -101,80 +112,92 @@ pub fn compute_congestion_levels(counts: &HashMap<String, u32>) -> HashMap<Strin
         .collect()
 }
 
-pub fn detect_traffic_light_state(
+pub fn detect_traffic_lights_from_detections(
     frame: &image::RgbImage,
+    detections: &[[f32; 6]],
     rois: &RoiMap,
+    original_w: u32,
+    original_h: u32,
 ) -> Vec<TrafficLightMetric> {
     let (w, h) = frame.dimensions();
     if w == 0 || h == 0 {
         return Vec::new();
     }
 
-    let scan_h = ((h as f32) * 0.65) as u32;
-    let step: u32 = if w > 1000 { 3 } else { 2 };
+    let mut outputs = Vec::new();
 
-    let mut red_count: u32 = 0;
-    let mut red_x_sum: f32 = 0.0;
-    let mut red_y_sum: f32 = 0.0;
+    for det in detections {
+        if !is_traffic_light_class(det[5] as i32) {
+            continue;
+        }
 
-    let mut yellow_count: u32 = 0;
-    let mut yellow_x_sum: f32 = 0.0;
-    let mut yellow_y_sum: f32 = 0.0;
+        let x1 = ((det[0] * original_w as f32) / 640.0).floor().max(0.0) as u32;
+        let y1 = ((det[1] * original_h as f32) / 640.0).floor().max(0.0) as u32;
+        let x2 = ((det[2] * original_w as f32) / 640.0).ceil().min(w as f32) as u32;
+        let y2 = ((det[3] * original_h as f32) / 640.0).ceil().min(h as f32) as u32;
 
-    let mut green_count: u32 = 0;
-    let mut green_x_sum: f32 = 0.0;
-    let mut green_y_sum: f32 = 0.0;
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
 
-    let mut y: u32 = 0;
-    while y < scan_h {
-        let mut x: u32 = 0;
-        while x < w {
-            let p = frame.get_pixel(x, y).0;
-            let (hue, sat, val) = rgb_to_hsv(p[0], p[1], p[2]);
+        let mut red_pixels: u32 = 0;
+        let mut yellow_pixels: u32 = 0;
+        let mut green_pixels: u32 = 0;
 
-            if val > 0.32 && sat > 0.35 {
-                if !(15.0..=345.0).contains(&hue) {
-                    red_count += 1;
-                    red_x_sum += x as f32;
-                    red_y_sum += y as f32;
-                } else if (25.0..=65.0).contains(&hue) {
-                    yellow_count += 1;
-                    yellow_x_sum += x as f32;
-                    yellow_y_sum += y as f32;
-                } else if (80.0..=160.0).contains(&hue) {
-                    green_count += 1;
-                    green_x_sum += x as f32;
-                    green_y_sum += y as f32;
+        for y in y1..y2 {
+            for x in x1..x2 {
+                let p = frame.get_pixel(x, y).0;
+                let (hue, sat, val) = rgb_to_hsv(p[0], p[1], p[2]);
+
+                if val > 0.39 && sat > 0.39 {
+                    if !(15.0..=345.0).contains(&hue) {
+                        red_pixels += 1;
+                    } else if (15.0..=35.0).contains(&hue) {
+                        yellow_pixels += 1;
+                    } else if (40.0..=90.0).contains(&hue) {
+                        green_pixels += 1;
+                    }
                 }
             }
-
-            x += step;
         }
-        y += step;
+
+        let pixel_counts = [
+            ("Red", red_pixels),
+            ("Yellow", yellow_pixels),
+            ("Green", green_pixels),
+        ];
+
+        let (best_color, best_val) = match pixel_counts.into_iter().max_by_key(|(_, v)| *v) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let color = if best_val > 20 {
+            best_color.to_string()
+        } else {
+            "Off".to_string()
+        };
+
+        let cx = (x1 + x2) as f32 * 0.5;
+        let cy = (y1 + y2) as f32 * 0.5;
+        let nearest_roi = nearest_roi_label(cx, cy, rois).unwrap_or_else(|| "None".to_string());
+
+        outputs.push(TrafficLightMetric {
+            color,
+            nearest_roi,
+            confidence: det[4],
+        });
     }
 
-    let min_pixels = ((w * scan_h) as f32 * 0.00008).max(10.0) as u32;
-    let candidates = [
-        ("Red", red_count, red_x_sum, red_y_sum),
-        ("Yellow", yellow_count, yellow_x_sum, yellow_y_sum),
-        ("Green", green_count, green_x_sum, green_y_sum),
-    ];
+    outputs
+}
 
-    let (color, count, x_sum, y_sum) = match candidates.into_iter().max_by_key(|(_, c, _, _)| *c) {
-        Some(top) if top.1 >= min_pixels => top,
-        _ => return Vec::new(),
-    };
+fn is_vehicle_class(class_id: i32) -> bool {
+    class_id == CLASS_CAR || class_id == CLASS_MOTORCYCLE || class_id == CLASS_TRUCK
+}
 
-    let cx = x_sum / count as f32;
-    let cy = y_sum / count as f32;
-    let nearest_roi = nearest_roi_label(cx, cy, rois).unwrap_or_else(|| "unknown".to_string());
-    let confidence = ((count as f32) / (min_pixels as f32 * 6.0)).clamp(0.3, 0.99);
-
-    vec![TrafficLightMetric {
-        color: color.to_string(),
-        nearest_roi,
-        confidence,
-    }]
+fn is_traffic_light_class(class_id: i32) -> bool {
+    class_id == CLASS_TRAFFIC_LIGHT
 }
 
 fn nearest_roi_label(x: f32, y: f32, rois: &RoiMap) -> Option<String> {

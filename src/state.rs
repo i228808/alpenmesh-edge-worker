@@ -3,7 +3,7 @@ use crossbeam_queue::ArrayQueue;
 use nvml_wrapper::Nvml;
 use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
 use ort::session::{builder::GraphOptimizationLevel, Session};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,8 @@ pub struct WorkerState {
     pub active_streams: Arc<AtomicUsize>,
     /// ROI polygons keyed by stream/camera id
     pub stream_rois: Arc<RwLock<HashMap<String, RoiMap>>>,
+    /// Active stream tasks currently owned by this worker
+    pub running_streams: Arc<RwLock<HashSet<String>>>,
 }
 
 impl WorkerState {
@@ -85,6 +87,7 @@ impl WorkerState {
             total_vram_mb,
             active_streams: Arc::new(AtomicUsize::new(0)),
             stream_rois: Arc::new(RwLock::new(HashMap::new())),
+            running_streams: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 

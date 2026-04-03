@@ -27,6 +27,21 @@ impl StreamController {
         Data(state): Data<WorkerState>,
         Json(payload): Json<StreamAssignPayload>,
     ) -> ApiResponse<()> {
+        {
+            let running = state.running_streams.read().unwrap();
+            if running.contains(&payload.stream_id) {
+                return ApiResponse::ok(());
+            }
+        }
+
+        {
+            let mut running = state.running_streams.write().unwrap();
+            if running.contains(&payload.stream_id) {
+                return ApiResponse::ok(());
+            }
+            running.insert(payload.stream_id.clone());
+        }
+
         if !payload.rois.is_empty() {
             let mut rois = state.stream_rois.write().unwrap();
             rois.insert(payload.stream_id.clone(), payload.rois.clone());

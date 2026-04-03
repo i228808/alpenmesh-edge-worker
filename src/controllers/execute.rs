@@ -201,7 +201,13 @@ impl ExecuteController {
         );
         let congestion_levels = crate::inference::compute_congestion_levels(&vehicle_counts);
         let total_vehicles: u32 = vehicle_counts.values().copied().sum();
-        let traffic_lights = crate::inference::detect_traffic_light_state(&original_rgb, &parsed_rois);
+        let traffic_lights = crate::inference::detect_traffic_lights_from_detections(
+            &original_rgb,
+            &final_boxes,
+            &parsed_rois,
+            original_w.max(1),
+            original_h.max(1),
+        );
 
         info!("[{}] Peak Inference completed in {}ms. Found {} detections.", camera_name, duration.as_millis(), final_boxes.len());
         
