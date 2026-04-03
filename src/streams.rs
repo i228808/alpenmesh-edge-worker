@@ -20,20 +20,33 @@ impl StreamManager {
             info!("Spawning Native Ingestion for stream {}: {}", stream_id, url);
             state.active_streams.fetch_add(1, Ordering::SeqCst);
 
+            let mut final_url = url.clone();
+            if final_url.ends_with(".stream/") {
+                final_url.push_str("playlist.m3u8");
+            }
+
+            let mut args = vec![];
+
+            if final_url.starts_with("rtsp://") {
+                args.push("-rtsp_transport");
+                args.push("tcp");
+            }
+
+            args.extend_from_slice(&[
+                "-hwaccel", "nvdec",
+                "-i", &final_url,
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", "640x640",
+                "-r", "5",
+                "-an",
+                "-"
+            ]);
+
             let mut child: Child = Command::new("ffmpeg")
-                .args([
-                    "-rtsp_transport", "tcp",
-                    "-hwaccel", "nvdec",
-                    "-i", &url,
-                    "-f", "rawvideo",
-                    "-pix_fmt", "rgb24",
-                    "-s", "640x640",
-                    "-r", "5",
-                    "-an",
-                    "-"
-                ])
+                .args(&args)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
                 .spawn()
                 .expect("Failed to spawn ffmpeg. Is it installed?");
 
@@ -78,6 +91,7 @@ impl StreamManager {
                             state_inner.pool.push(model_arc).ok();
 
                             let detections = crate::inference::decode_output(&result);
+                            info!("[{}] Processed frame natively. Detections: {}", sid, detections.len());
                             if !detections.is_empty() {
                                 info!("[{}] Detected {} objects natively.", sid, detections.len());
                             }
