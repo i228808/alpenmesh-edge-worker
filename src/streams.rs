@@ -15,6 +15,8 @@ impl StreamManager {
 
     pub async fn spawn_stream(&self, stream_id: String, url: String) {
         let state = self.state.clone();
+        let metrics_client = reqwest::Client::new();
+        let scheduler_client = reqwest::Client::new();
         
         tokio::spawn(async move {
             info!("Spawning Native Ingestion for stream {}: {}", stream_id, url);
@@ -32,7 +34,29 @@ impl StreamManager {
                 args.push("tcp");
             }
 
+            if final_url.starts_with("http://") || final_url.starts_with("https://") {
+                args.extend_from_slice(&[
+                    "-user_agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "-rw_timeout",
+                    "15000000",
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_on_network_error",
+                    "1",
+                    "-reconnect_on_http_error",
+                    "4xx,5xx",
+                    "-reconnect_delay_max",
+                    "10",
+                ]);
+            }
+
             args.extend_from_slice(&[
+                "-hide_banner",
+                "-loglevel",
+                "warning",
                 "-hwaccel", "nvdec",
                 "-i", &final_url,
                 "-f", "rawvideo",
@@ -60,8 +84,10 @@ impl StreamManager {
                         let rgb_data = buffer.clone();
                         let state_inner = state.clone();
                         let sid = stream_id.clone();
+                        let client_inner = metrics_client.clone();
 
                         tokio::spawn(async move {
+                            let frame_for_metrics = rgb_data.clone();
                             let input = ndarray::Array::from_shape_vec((640, 640, 3), rgb_data)
                                 .expect("Failed to reshape raw ffmpeg data")
                                 .mapv(|v| v as f32 / 255.0)
@@ -90,15 +116,69 @@ impl StreamManager {
 
                             state_inner.pool.push(model_arc).ok();
 
-                            let detections = crate::inference::decode_output(&result);
-                            info!("[{}] Processed frame natively. Detections: {}", sid, detections.len());
-                            if !detections.is_empty() {
-                                info!("[{}] Detected {} objects natively.", sid, detections.len());
+                            let decoded = crate::inference::decode_output(&result);
+                            let detections = crate::inference::apply_nms(decoded, 0.45);
+
+                            let stream_rois = {
+                                let rois = state_inner.stream_rois.read().unwrap();
+                                rois.get(&sid).cloned().unwrap_or_default()
+                            };
+
+                            let vehicle_counts = crate::inference::compute_roi_vehicle_counts(
+                                &detections,
+                                &stream_rois,
+                                640,
+                                640,
+                            );
+                            let congestion_levels = crate::inference::compute_congestion_levels(&vehicle_counts);
+                            let total_vehicles: u32 = vehicle_counts.values().copied().sum();
+
+                            let rgb_img = image::RgbImage::from_raw(640, 640, frame_for_metrics)
+                                .unwrap_or_else(|| image::RgbImage::new(640, 640));
+                            let traffic_lights = crate::inference::detect_traffic_light_state(&rgb_img, &stream_rois);
+
+                            let payload = serde_json::json!({
+                                "camera_name": sid.clone(),
+                                "vehicle_counts": vehicle_counts,
+                                "congestion_levels": congestion_levels,
+                                "total_vehicles": total_vehicles,
+                                "traffic_lights": traffic_lights
+                            });
+
+                            match client_inner
+                                .post("http://127.0.0.1:3000/api/v1/metrics")
+                                .json(&payload)
+                                .send()
+                                .await
+                            {
+                                Ok(res) if res.status().is_success() => {
+                                    info!("[{}] Processed frame. Detections: {}. Metrics stored.", sid, detections.len());
+                                }
+                                Ok(res) => {
+                                    error!("[{}] Metrics push failed with status {}", sid, res.status());
+                                }
+                                Err(e) => {
+                                    error!("[{}] Failed to push metrics to scheduler: {}", sid, e);
+                                }
                             }
                         });
                     }
                     Err(e) => {
                         error!("FFmpeg stream broke for {}: {}", stream_id, e);
+
+                        let status_payload = serde_json::json!({
+                            "worker_id": "gpu-worker-1",
+                            "stream_id": stream_id,
+                            "status": "failed",
+                            "reason": e.to_string(),
+                        });
+
+                        let _ = scheduler_client
+                            .post("http://127.0.0.1:3000/api/v1/nodes/stream-status")
+                            .json(&status_payload)
+                            .send()
+                            .await;
+
                         break;
                     }
                 }
