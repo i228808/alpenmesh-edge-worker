@@ -156,6 +156,7 @@ impl ExecuteController {
         // 4. Post-processing (Filtering & NMS)
         let decoded = crate::inference::decode_output(&result);
         let final_boxes = crate::inference::apply_nms(decoded, 0.45);
+        state.record_inference(&camera_name);
 
         // 5. Visual Debug Capture (Background task, non-blocking)
         let debug_count = state.debug_capture_count.load(std::sync::atomic::Ordering::Relaxed);

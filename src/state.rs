@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct WorkerState {
@@ -25,6 +26,23 @@ pub struct WorkerState {
     pub stream_rois: Arc<RwLock<HashMap<String, RoiMap>>>,
     /// Active stream tasks currently owned by this worker
     pub running_streams: Arc<RwLock<HashSet<String>>>,
+    /// Batched proof-of-inference counters flushed periodically to scheduler
+    pub proof_accumulator: Arc<RwLock<ProofAccumulator>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProofAccumulator {
+    pub window_start_ms: u64,
+    pub total_inferences: u64,
+    pub camera_inferences: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProofBatch {
+    pub window_start_ms: u64,
+    pub window_end_ms: u64,
+    pub total_inferences: u64,
+    pub camera_inferences: HashMap<String, u64>,
 }
 
 impl WorkerState {
@@ -88,7 +106,47 @@ impl WorkerState {
             active_streams: Arc::new(AtomicUsize::new(0)),
             stream_rois: Arc::new(RwLock::new(HashMap::new())),
             running_streams: Arc::new(RwLock::new(HashSet::new())),
+            proof_accumulator: Arc::new(RwLock::new(ProofAccumulator {
+                window_start_ms: now_unix_ms(),
+                total_inferences: 0,
+                camera_inferences: HashMap::new(),
+            })),
         }
+    }
+
+    pub fn record_inference(&self, camera_name: &str) {
+        let mut guard = self.proof_accumulator.write().unwrap();
+        guard.total_inferences = guard.total_inferences.saturating_add(1);
+        let entry = guard
+            .camera_inferences
+            .entry(camera_name.to_string())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    pub fn drain_proof_batch(&self) -> Option<ProofBatch> {
+        let now_ms = now_unix_ms();
+        let mut guard = self.proof_accumulator.write().unwrap();
+
+        if guard.total_inferences == 0 {
+            if now_ms.saturating_sub(guard.window_start_ms) >= 30_000 {
+                guard.window_start_ms = now_ms;
+            }
+            return None;
+        }
+
+        let batch = ProofBatch {
+            window_start_ms: guard.window_start_ms,
+            window_end_ms: now_ms,
+            total_inferences: guard.total_inferences,
+            camera_inferences: guard.camera_inferences.clone(),
+        };
+
+        guard.window_start_ms = now_ms;
+        guard.total_inferences = 0;
+        guard.camera_inferences.clear();
+
+        Some(batch)
     }
 
     fn calculate_pool_size(
@@ -128,9 +186,7 @@ impl WorkerState {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .expect("Failed to set optimization level")
             .with_memory_pattern(true)
-            .expect("Failed to set memory pattern")
-            .with_config_entry("session.disable_cpu_ep_fallback", "1")
-            .expect("Failed to disable CPU fallback");
+            .expect("Failed to set memory pattern");
 
         let trt_provider = TensorRTExecutionProvider::default()
             .with_fp16(true)
@@ -145,4 +201,11 @@ impl WorkerState {
             .commit_from_file("assets/yolov8n.onnx")
             .expect("Failed to load model from assets/yolov8n.onnx")
     }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

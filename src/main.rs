@@ -4,6 +4,7 @@ mod heartbeat;
 mod state;
 mod inference;
 mod streams;
+mod proofs;
 
 use crate::state::WorkerState;
 
@@ -24,6 +25,7 @@ fn main() {
 
     // 2. Initialize background tokio task for heartbeat with telemetry
     heartbeat::start_heartbeat_task(state.clone());
+    proofs::start_proof_flush_task(state.clone());
 
     println!("--------------------------------------------------");
     println!("🚀 OXIDE WORKER STARTING: SPECS-AWARE NATIVE INGESTION");

@@ -171,6 +171,7 @@ impl StreamManager {
 
                                 let decoded = crate::inference::decode_output(&result);
                                 let detections = crate::inference::apply_nms(decoded, 0.45);
+                                state_inner.record_inference(&sid);
 
                                 let stream_rois = {
                                     let rois = state_inner.stream_rois.read().unwrap();
