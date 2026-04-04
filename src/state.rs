@@ -28,6 +28,8 @@ pub struct WorkerState {
     pub running_streams: Arc<RwLock<HashSet<String>>>,
     /// Batched proof-of-inference counters flushed periodically to scheduler
     pub proof_accumulator: Arc<RwLock<ProofAccumulator>>,
+    /// Stable worker identity used in proof batching and scheduler accounting
+    pub worker_id: Arc<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +113,12 @@ impl WorkerState {
                 total_inferences: 0,
                 camera_inferences: HashMap::new(),
             })),
+            worker_id: Arc::new(
+                std::env::var("WORKER_ID")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "gpu-worker-1".to_string()),
+            ),
         }
     }
 

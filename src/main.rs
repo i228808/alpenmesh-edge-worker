@@ -22,6 +22,7 @@ fn main() {
 
     // 1. Initialize GPU inference state (with hardware check)
     let state = WorkerState::new();
+    println!("🔑 Worker ID: {}", state.worker_id);
 
     // 2. Initialize background tokio task for heartbeat with telemetry
     heartbeat::start_heartbeat_task(state.clone());

@@ -3,7 +3,6 @@ use tracing::{error, info};
 
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const SCHEDULER_PROOFS_ENDPOINT: &str = "http://127.0.0.1:3000/api/v1/proofs";
-const WORKER_ID: &str = "gpu-worker-1";
 
 pub fn start_proof_flush_task(state: WorkerState) {
     std::thread::spawn(move || {
@@ -22,7 +21,7 @@ pub fn start_proof_flush_task(state: WorkerState) {
                     continue;
                 };
 
-                if let Err(err) = post_proof_batch(&client, batch).await {
+                if let Err(err) = post_proof_batch(&client, &state.worker_id, batch).await {
                     error!("Proof batch push failed: {}", err);
                 }
             }
@@ -30,9 +29,13 @@ pub fn start_proof_flush_task(state: WorkerState) {
     });
 }
 
-async fn post_proof_batch(client: &reqwest::Client, batch: ProofBatch) -> Result<(), reqwest::Error> {
+async fn post_proof_batch(
+    client: &reqwest::Client,
+    worker_id: &str,
+    batch: ProofBatch,
+) -> Result<(), reqwest::Error> {
     let payload = serde_json::json!({
-        "worker_id": WORKER_ID,
+        "worker_id": worker_id,
         "window_start_ms": batch.window_start_ms,
         "window_end_ms": batch.window_end_ms,
         "total_inferences": batch.total_inferences,
