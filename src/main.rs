@@ -5,6 +5,7 @@ mod state;
 mod inference;
 mod streams;
 mod proofs;
+mod identity;
 
 use crate::state::WorkerState;
 
@@ -22,14 +23,30 @@ fn main() {
 
     // 1. Initialize GPU inference state (with hardware check)
     let state = WorkerState::new();
+    let identity_path = crate::identity::identity_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
     println!("🔑 Worker ID: {}", state.worker_id);
+    println!(
+        "🧾 Worker Secret: ********{}",
+        state
+            .worker_secret
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+    println!("💾 Worker Identity File: {}", identity_path);
 
     // 2. Initialize background tokio task for heartbeat with telemetry
     heartbeat::start_heartbeat_task(state.clone());
     proofs::start_proof_flush_task(state.clone());
 
     println!("--------------------------------------------------");
-    println!("🚀 OXIDE WORKER STARTING: SPECS-AWARE NATIVE INGESTION");
+    println!("🚀 ALPENMESH WORKER STARTING: SPECS-AWARE NATIVE INGESTION");
     println!("--------------------------------------------------");
 
     App::new()

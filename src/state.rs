@@ -30,6 +30,8 @@ pub struct WorkerState {
     pub proof_accumulator: Arc<RwLock<ProofAccumulator>>,
     /// Stable worker identity used in proof batching and scheduler accounting
     pub worker_id: Arc<String>,
+    /// Local persistent secret for secure worker registry binding
+    pub worker_secret: Arc<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +102,9 @@ impl WorkerState {
         println!("✅ POOL DEPLOYED: {} Parallel GPU Lanes Active", pool_size);
         println!("--------------------------------------------------");
 
+        let identity = crate::identity::load_or_create_identity()
+            .expect("Failed to load/create local worker identity");
+
         Self {
             pool: Arc::new(pool),
             debug_capture_count: Arc::new(AtomicUsize::new(0)),
@@ -117,8 +122,9 @@ impl WorkerState {
                 std::env::var("WORKER_ID")
                     .ok()
                     .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "gpu-worker-1".to_string()),
+                    .unwrap_or_else(|| identity.worker_id.clone()),
             ),
+            worker_secret: Arc::new(identity.worker_secret),
         }
     }
 

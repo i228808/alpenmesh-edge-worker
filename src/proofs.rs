@@ -3,6 +3,7 @@ use tracing::{error, info};
 
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const SCHEDULER_PROOFS_ENDPOINT: &str = "http://127.0.0.1:3000/api/v1/proofs";
+const ECONOMY_REGISTER_ENDPOINT: &str = "http://127.0.0.1:3010/api/v1/economy/workers/register";
 
 pub fn start_proof_flush_task(state: WorkerState) {
     std::thread::spawn(move || {
@@ -13,6 +14,9 @@ pub fn start_proof_flush_task(state: WorkerState) {
 
         rt.block_on(async move {
             let client = reqwest::Client::new();
+            if let Err(err) = register_worker_identity(&client, &state.worker_id, &state.worker_secret).await {
+                error!("Worker identity registration failed: {}", err);
+            }
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(FLUSH_INTERVAL_SECS)).await;
@@ -27,6 +31,31 @@ pub fn start_proof_flush_task(state: WorkerState) {
             }
         });
     });
+}
+
+async fn register_worker_identity(
+    client: &reqwest::Client,
+    worker_id: &str,
+    worker_secret: &str,
+) -> Result<(), reqwest::Error> {
+    let payload = serde_json::json!({
+        "worker_id": worker_id,
+        "worker_secret": worker_secret,
+    });
+
+    let response = client
+        .post(ECONOMY_REGISTER_ENDPOINT)
+        .json(&payload)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        info!("Worker identity registered in alpenmesh economy service");
+    } else {
+        error!("Worker registration rejected with status {}", response.status());
+    }
+
+    Ok(())
 }
 
 async fn post_proof_batch(
