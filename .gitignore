@@ -4,10 +4,11 @@ app.worker2.yaml
 *.log
 *.py
 /debug
-.env
 eval_runs
 graphify-out
 *.json
 *.txt
 .graphify_python
 assets
+config.bat
+node_modules
