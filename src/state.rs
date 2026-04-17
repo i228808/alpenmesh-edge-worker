@@ -239,11 +239,10 @@ impl WorkerState {
         );
 
         // Configuration:
-        // Reserved VRAM for OS/Display: 1.5 GB (Safe margin for Windows)
-        // Nirikshan needs substantially more VRAM than yolov8n once TensorRT caches
-        // are materialized, so keep the lane budget conservative.
-        let reserved = 1536;
-        let per_session = 800;
+        // Reserved VRAM for OS/Display: 1 GB
+        // YOLOv11 TensorRT (FP16) lanes actually take less VRAM than the old model.
+        let reserved = 1024;
+        let per_session = 350;
 
         if free_mb < reserved + per_session {
             return Ok(1);

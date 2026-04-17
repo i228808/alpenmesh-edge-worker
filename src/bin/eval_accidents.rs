@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use alpenmesh_worker::{accident_debug, alpen_detect, state::WorkerState};
+use alpenmesh_worker::{accident_debug, alpen_detect, motion, state::WorkerState, tracker::{Tracker, TrackEvent}};
+use std::collections::HashMap;
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -25,6 +26,9 @@ struct Args {
     /// Enable extended metrics columns (tracked vehicles, dwell, stalled, skip reason)
     #[arg(long, default_value_t = false)]
     emit_metrics: bool,
+    /// When emit_metrics is set, also engage the motion pre-filter (skips YOLO on static frames)
+    #[arg(long, default_value_t = false)]
+    skip_motion: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -126,9 +130,10 @@ fn main() -> Result<()> {
     }
 
     let emit_metrics = args.emit_metrics;
+    let skip_motion = args.skip_motion;
     let mut all = Vec::new();
     for (path, label) in videos {
-        let metrics = eval_one(&state, &path, label, args.fps, &frames_root, &mut timeline, emit_metrics)?;
+        let metrics = eval_one(&state, &path, label, args.fps, &frames_root, &mut timeline, emit_metrics, skip_motion)?;
         let mut row = vec![
             metrics.label.to_string(),
             metrics.video_stem.clone(),
@@ -176,7 +181,7 @@ fn main() -> Result<()> {
         .filter(|m| m.label == "neg" && m.nirikshan_night_enhanced_fires > 0)
         .count() as f64;
 
-    let summary = format!(
+    let mut summary = format!(
         "# AlpenDetect Evaluation\n\n- positives: {}\n- negatives: {}\n- day recall: {:.2}%\n- night-enhanced recall: {:.2}%\n- day FP video rate: {:.2}%\n- night-enhanced FP video rate: {:.2}%\n",
         pos_total as usize,
         neg_total as usize,
@@ -185,6 +190,18 @@ fn main() -> Result<()> {
         pct(neg_day_fp, neg_total),
         pct(neg_night_fp, neg_total),
     );
+    if emit_metrics {
+        let total_tracked: u64 = all.iter().map(|m| m.total_tracked_vehicles).sum();
+        let mean_dwell = {
+            let videos_with_dwell: Vec<f64> = all.iter().filter(|m| m.mean_dwell_sec > 0.0).map(|m| m.mean_dwell_sec).collect();
+            if videos_with_dwell.is_empty() { 0.0 } else { videos_with_dwell.iter().sum::<f64>() / videos_with_dwell.len() as f64 }
+        };
+        let total_stalled: u64 = all.iter().map(|m| m.stalled_events).sum();
+        summary.push_str(&format!(
+            "\n## Tracker Metrics\n\n- total_tracked_vehicles: {}\n- mean_dwell_sec: {:.3}\n- stalled_events: {}\n",
+            total_tracked, mean_dwell, total_stalled,
+        ));
+    }
     fs::write(run_dir.join("summary.md"), summary)?;
     println!("Wrote evaluation to {}", run_dir.display());
     Ok(())
@@ -198,6 +215,7 @@ fn eval_one(
     frames_root: &Path,
     timeline: &mut csv::Writer<std::fs::File>,
     emit_metrics: bool,
+    skip_motion: bool,
 ) -> Result<PerVideo> {
     let mut child = spawn_ffmpeg(video_path, fps)?;
     let stdout = child.stdout.as_mut().context("ffmpeg stdout missing")?;
@@ -218,6 +236,16 @@ fn eval_one(
         ..PerVideo::default()
     };
 
+    let mut tracker = Tracker::new();
+    let mut total_entered: u64 = 0;
+    let mut total_stalled: u64 = 0;
+    let mut exited_dwell_times: Vec<f32> = Vec::new();
+    let mut detection_count: u64 = 0;
+
+    let empty_rois: HashMap<String, Vec<[i32; 2]>> = HashMap::new();
+    let mut prev_roi_hashes: HashMap<String, [u8; 64]> = HashMap::new();
+    let mut prev_full_hash: Option<[u8; 64]> = None;
+
     loop {
         if let Err(err) = stdout.read_exact(&mut frame) {
             if err.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -229,6 +257,53 @@ fn eval_one(
         idx += 1;
         let sec = idx as f64 / fps.max(1) as f64;
         let dark_ratio = alpenmesh_worker::night_enhance::dark_ratio(&frame);
+
+        if skip_motion && emit_metrics {
+            let (skip, new_roi_hashes, new_full_hash) = motion::should_skip_frame(
+                &frame,
+                &empty_rois,
+                &prev_roi_hashes,
+                prev_full_hash.as_ref(),
+            );
+            prev_roi_hashes = new_roi_hashes;
+            prev_full_hash = Some(new_full_hash);
+
+            if skip {
+                let coast_events = tracker.coast(idx, sec);
+                for ev in &coast_events {
+                    match ev {
+                        TrackEvent::Entered { .. } => total_entered += 1,
+                        TrackEvent::Exited { dwell_sec, .. } => exited_dwell_times.push(*dwell_sec),
+                        TrackEvent::Stalled { .. } => total_stalled += 1,
+                    }
+                }
+                metrics.frames_processed += 1;
+                metrics.duration_sec = sec;
+
+                if emit_metrics {
+                    let mut tl_row = vec![
+                        label.to_string(),
+                        stem.clone(),
+                        idx.to_string(),
+                        format!("{sec:.3}"),
+                        "day".to_string(),
+                        format!("{dark_ratio:.3}"),
+                        "0".to_string(),
+                        "0.000".to_string(),
+                        "false".to_string(),
+                    ];
+                    tl_row.extend_from_slice(&[
+                        "low_motion".to_string(),
+                        "0.0".to_string(),
+                        "0".to_string(),
+                        tracker.active_track_count().to_string(),
+                    ]);
+                    timeline.write_record(&tl_row)?;
+                }
+                continue;
+            }
+        }
+
         let start = Instant::now();
         let day_dets = run_detector(state, &frame);
         let day_summary = alpen_detect::summarize_detections(day_dets, sec, false, dark_ratio);
@@ -245,6 +320,27 @@ fn eval_one(
             day_summary.clone()
         };
         total_ms += start.elapsed().as_secs_f64() * 1000.0;
+        detection_count += 1;
+
+        let events = tracker.update(&final_summary.detections, idx, sec);
+        let active_count = tracker.active_track_count();
+        let mean_dwell_this_frame = {
+            let active = tracker.active_tracks();
+            if active.is_empty() {
+                0.0
+            } else {
+                active.values().map(|t| sec - t.entered_at_sec).sum::<f64>() / active.len() as f64
+            }
+        };
+        let has_stalled = events.iter().any(|e| matches!(e, TrackEvent::Stalled { .. }));
+
+        for ev in &events {
+            match ev {
+                TrackEvent::Entered { .. } => total_entered += 1,
+                TrackEvent::Exited { dwell_sec, .. } => exited_dwell_times.push(*dwell_sec),
+                TrackEvent::Stalled { .. } => total_stalled += 1,
+            }
+        }
 
         metrics.frames_processed += 1;
         metrics.duration_sec = sec;
@@ -309,10 +405,10 @@ fn eval_one(
             ];
             if emit_metrics {
                 tl_row.extend_from_slice(&[
-                    String::new(),  // skip_reason (populated in Phase 9)
-                    "0.0".to_string(),  // dwell_time_sec (populated in Phase 7)
-                    "0".to_string(),    // stalled_flag (populated in Phase 8)
-                    "0".to_string(),    // tracked_vehicle_count (populated in Phase 5)
+                    String::new(),
+                    format!("{:.3}", mean_dwell_this_frame),
+                    if has_stalled { "1" } else { "0" }.to_string(),
+                    active_count.to_string(),
                 ]);
             }
             timeline.write_record(&tl_row)?;
@@ -321,7 +417,14 @@ fn eval_one(
 
     let _ = child.kill();
     let _ = child.wait();
-    metrics.mean_detect_ms = total_ms / metrics.frames_processed.max(1) as f64;
+    metrics.mean_detect_ms = total_ms / detection_count.max(1) as f64;
+    metrics.total_tracked_vehicles = total_entered;
+    metrics.stalled_events = total_stalled;
+    metrics.mean_dwell_sec = if exited_dwell_times.is_empty() {
+        0.0
+    } else {
+        exited_dwell_times.iter().map(|d| *d as f64).sum::<f64>() / exited_dwell_times.len() as f64
+    };
     Ok(metrics)
 }
 
