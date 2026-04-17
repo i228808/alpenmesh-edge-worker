@@ -1,12 +1,11 @@
+use crate::alpen_detect::{
+    ALPEN_DETECT_NUM_ANCHORS, ALPEN_DETECT_NUM_CLASSES, ALPEN_DETECT_VEHICLE_CLASSES,
+    confidence_threshold_for_class,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 
 pub type RoiMap = HashMap<String, Vec<[i32; 2]>>;
-
-const CLASS_CAR: i32 = 2;
-const CLASS_MOTORCYCLE: i32 = 3;
-const CLASS_TRUCK: i32 = 7;
-const CLASS_TRAFFIC_LIGHT: i32 = 9;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TrafficLightMetric {
@@ -16,42 +15,45 @@ pub struct TrafficLightMetric {
 }
 
 pub fn decode_output(raw_data: &[f32]) -> Vec<[f32; 6]> {
-    let mut results = Vec::with_capacity(50);
-    let num_anchors = 8400;
-    let classes = [
-        CLASS_CAR,
-        CLASS_MOTORCYCLE,
-        CLASS_TRUCK,
-        CLASS_TRAFFIC_LIGHT,
-    ];
+    let expected = (4 + ALPEN_DETECT_NUM_CLASSES) * ALPEN_DETECT_NUM_ANCHORS;
+    if raw_data.len() < expected {
+        return Vec::new();
+    }
 
-    for col in 0..num_anchors {
+    let mut results = Vec::with_capacity(128);
+    for anchor in 0..ALPEN_DETECT_NUM_ANCHORS {
         let mut best_score = 0.0f32;
-        let mut best_class = -1i32;
+        let mut best_class = None;
 
-        for class_id in classes {
-            let score_idx = (4 + class_id as usize) * num_anchors + col;
+        for class_id in 0..ALPEN_DETECT_NUM_CLASSES {
+            let score_idx = (4 + class_id) * ALPEN_DETECT_NUM_ANCHORS + anchor;
             let score = raw_data[score_idx];
             if score > best_score {
                 best_score = score;
-                best_class = class_id;
+                best_class = Some(class_id);
             }
         }
 
-        if best_score > 0.50 && best_class >= 0 {
-            let cx = raw_data[0 * num_anchors + col];
-            let cy = raw_data[1 * num_anchors + col];
-            let w = raw_data[2 * num_anchors + col];
-            let h = raw_data[3 * num_anchors + col];
-
-            // Convert cx,cy,w,h to x1,y1,x2,y2 (Still in 640x640 space)
-            let x1 = cx - w / 2.0;
-            let y1 = cy - h / 2.0;
-            let x2 = cx + w / 2.0;
-            let y2 = cy + h / 2.0;
-
-            results.push([x1, y1, x2, y2, best_score, best_class as f32]);
+        let Some(class_id) = best_class else {
+            continue;
+        };
+        if best_score < confidence_threshold_for_class(class_id) {
+            continue;
         }
+
+        let cx = raw_data[anchor];
+        let cy = raw_data[ALPEN_DETECT_NUM_ANCHORS + anchor];
+        let w = raw_data[2 * ALPEN_DETECT_NUM_ANCHORS + anchor];
+        let h = raw_data[3 * ALPEN_DETECT_NUM_ANCHORS + anchor];
+        let x1 = (cx - w / 2.0).clamp(0.0, 640.0);
+        let y1 = (cy - h / 2.0).clamp(0.0, 640.0);
+        let x2 = (cx + w / 2.0).clamp(0.0, 640.0);
+        let y2 = (cy + h / 2.0).clamp(0.0, 640.0);
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+
+        results.push([x1, y1, x2, y2, best_score, class_id as f32]);
     }
 
     results
@@ -193,11 +195,12 @@ pub fn detect_traffic_lights_from_detections(
 }
 
 fn is_vehicle_class(class_id: i32) -> bool {
-    class_id == CLASS_CAR || class_id == CLASS_MOTORCYCLE || class_id == CLASS_TRUCK
+    ALPEN_DETECT_VEHICLE_CLASSES.contains(&(class_id as usize))
 }
 
 fn is_traffic_light_class(class_id: i32) -> bool {
-    class_id == CLASS_TRAFFIC_LIGHT
+    let _ = class_id;
+    false
 }
 
 fn nearest_roi_label(x: f32, y: f32, rois: &RoiMap) -> Option<String> {
@@ -339,4 +342,104 @@ fn iou(box_a: &[f32; 6], box_b: &[f32; 6]) -> f32 {
     }
 
     intersection / (area_a + area_b - intersection)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: Tracker-based ROI traffic metrics
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RoiTrafficMetrics {
+    /// Current number of tracked vehicles in this ROI.
+    pub occupancy: u32,
+    /// Mean dwell time (seconds) of vehicles currently in the ROI.
+    pub mean_dwell_sec: f32,
+    /// Number of tracks in this ROI flagged as stalled.
+    pub stalled_count: u32,
+    /// Vehicles that exited the ROI with dwell between 8–30s in the recent window.
+    pub slow_throughput: u32,
+    /// Rate of occupancy change: (current - previous) / window_sec.
+    pub queue_growth_rate: f32,
+}
+
+/// Compute per-ROI traffic metrics from the tracker state.
+///
+/// This replaces `compute_roi_vehicle_counts` for the live stream path. It
+/// provides richer signals including dwell time, stall counts, slow throughput,
+/// and queue growth rate.
+///
+/// `previous_occupancy` is the occupancy map from the prior window — if `None`,
+/// queue_growth_rate will be 0.
+pub fn compute_roi_traffic_metrics(
+    tracker: &crate::tracker::Tracker,
+    rois: &RoiMap,
+    img_w: u32,
+    img_h: u32,
+    current_sec: f64,
+    previous_occupancy: Option<&HashMap<String, u32>>,
+    window_sec: f32,
+) -> HashMap<String, RoiTrafficMetrics> {
+    let mut metrics: HashMap<String, RoiTrafficMetrics> = rois
+        .keys()
+        .map(|k| {
+            (
+                k.clone(),
+                RoiTrafficMetrics {
+                    occupancy: 0,
+                    mean_dwell_sec: 0.0,
+                    stalled_count: 0,
+                    slow_throughput: 0,
+                    queue_growth_rate: 0.0,
+                },
+            )
+        })
+        .collect();
+
+    if rois.is_empty() {
+        return metrics;
+    }
+
+    // For each active track, determine which ROI it belongs to
+    for track in tracker.active_tracks().values() {
+        let cx = (track.bbox[0] + track.bbox[2]) * 0.5 * img_w as f32 / 640.0;
+        let cy = (track.bbox[1] + track.bbox[3]) * 0.5 * img_h as f32 / 640.0;
+
+        for (roi_name, poly) in rois {
+            if point_in_polygon(cx, cy, poly) {
+                if let Some(m) = metrics.get_mut(roi_name) {
+                    let dwell = (current_sec - track.entered_at_sec) as f32;
+                    m.occupancy += 1;
+                    m.mean_dwell_sec += dwell;
+
+                    if track.stalled_emitted {
+                        m.stalled_count += 1;
+                    }
+
+                    // Slow throughput: vehicles dwelling 8–30s (recently exited
+                    // would be ideal, but as an approximation we count active
+                    // tracks in that range too)
+                    if dwell >= 8.0 && dwell <= 30.0 {
+                        m.slow_throughput += 1;
+                    }
+                }
+                break; // each track in at most one ROI
+            }
+        }
+    }
+
+    // Finalize mean dwell and queue growth
+    for (name, m) in metrics.iter_mut() {
+        if m.occupancy > 0 {
+            m.mean_dwell_sec /= m.occupancy as f32;
+        }
+        if let Some(prev) = previous_occupancy {
+            let prev_occ = prev.get(name).copied().unwrap_or(0);
+            if window_sec > 0.0 {
+                m.queue_growth_rate =
+                    (m.occupancy as f32 - prev_occ as f32) / window_sec;
+            }
+        }
+    }
+
+    metrics
 }

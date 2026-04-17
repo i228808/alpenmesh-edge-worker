@@ -2,8 +2,6 @@ use crate::state::{ProofBatch, WorkerState};
 use tracing::{error, info};
 
 const FLUSH_INTERVAL_SECS: u64 = 5;
-const SCHEDULER_PROOFS_ENDPOINT: &str = "http://127.0.0.1:3000/api/v1/proofs";
-const ECONOMY_REGISTER_ENDPOINT: &str = "http://127.0.0.1:3010/api/v1/economy/workers/register";
 
 pub fn start_proof_flush_task(state: WorkerState) {
     std::thread::spawn(move || {
@@ -14,7 +12,18 @@ pub fn start_proof_flush_task(state: WorkerState) {
 
         rt.block_on(async move {
             let client = reqwest::Client::new();
-            if let Err(err) = register_worker_identity(&client, &state.worker_id, &state.worker_secret).await {
+            let economy_register_url =
+                format!("{}/api/v1/economy/workers/register", state.economy_url);
+            let proofs_url = format!("{}/api/v1/proofs", state.scheduler_url);
+
+            if let Err(err) = register_worker_identity(
+                &client,
+                &economy_register_url,
+                &state.worker_id,
+                &state.worker_secret,
+            )
+            .await
+            {
                 error!("Worker identity registration failed: {}", err);
             }
 
@@ -25,7 +34,9 @@ pub fn start_proof_flush_task(state: WorkerState) {
                     continue;
                 };
 
-                if let Err(err) = post_proof_batch(&client, &state.worker_id, batch).await {
+                if let Err(err) =
+                    post_proof_batch(&client, &proofs_url, &state.worker_id, batch).await
+                {
                     error!("Proof batch push failed: {}", err);
                 }
             }
@@ -35,6 +46,7 @@ pub fn start_proof_flush_task(state: WorkerState) {
 
 async fn register_worker_identity(
     client: &reqwest::Client,
+    url: &str,
     worker_id: &str,
     worker_secret: &str,
 ) -> Result<(), reqwest::Error> {
@@ -43,11 +55,7 @@ async fn register_worker_identity(
         "worker_secret": worker_secret,
     });
 
-    let response = client
-        .post(ECONOMY_REGISTER_ENDPOINT)
-        .json(&payload)
-        .send()
-        .await?;
+    let response = client.post(url).json(&payload).send().await?;
 
     if response.status().is_success() {
         info!("Worker identity registered in alpenmesh economy service");
@@ -60,6 +68,7 @@ async fn register_worker_identity(
 
 async fn post_proof_batch(
     client: &reqwest::Client,
+    url: &str,
     worker_id: &str,
     batch: ProofBatch,
 ) -> Result<(), reqwest::Error> {
@@ -71,7 +80,7 @@ async fn post_proof_batch(
         "camera_inferences": batch.camera_inferences,
     });
 
-    let response = client.post(SCHEDULER_PROOFS_ENDPOINT).json(&payload).send().await?;
+    let response = client.post(url).json(&payload).send().await?;
     if response.status().is_success() {
         info!(
             "Proof batch sent: total_inferences={} window_start_ms={} window_end_ms={}",

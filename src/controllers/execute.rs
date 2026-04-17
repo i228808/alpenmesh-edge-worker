@@ -4,6 +4,7 @@ use std::time::Instant;
 use tracing::info;
 
 use crate::state::WorkerState;
+use crate::alpen_detect::{self, DetectionSummary};
 use crate::inference::RoiMap;
 
 pub struct ExecuteController;
@@ -111,51 +112,14 @@ impl ExecuteController {
         let mut resizer = fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
         resizer.resize(&src_image.view(), &mut dst_image.view_mut()).expect("Failed to resize image");
 
-        // 2. Vectorized Normalization and Reshape (HWC -> CHW)
         let rgb_data = dst_image.into_vec();
-        let input = ndarray::Array::from_shape_vec((640, 640, 3), rgb_data)
-            .expect("Failed to reshape image data")
-            .mapv(|v| v as f32 / 255.0)
-            .permuted_axes([2, 0, 1])
-            .insert_axis(ndarray::Axis(0))
-            .into_dyn();
-
-        // 3. Inference & I/O Binding
-        let input_tensor = match ort::value::Value::from_array(input) {
-            Ok(v) => v,
-            Err(e) => return ApiResponse::internal_error(format!("Failed to create input tensor: {}", e)),
-        };
-
-        // 3b. High-Performance Session Acquisition from Pool
-        let model_arc = loop {
-            if let Some(s) = state.pool.pop() {
-                break s;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        };
-
-        let result = {
-            let mut model = model_arc.lock().expect("Failed to lock model session");
-            let mut io_binding = model.create_binding().expect("Failed to create binding");
-            
-            io_binding.bind_input("images", &input_tensor).expect("Failed to bind input");
-            io_binding.bind_output_to_device("output0", model.allocator().memory_info()).expect("Failed to bind output");
-
-            let outputs = model.run_binding(&io_binding).expect("Model execution with I/O binding failed");
-
-            match outputs["output0"].try_extract_tensor::<f32>() {
-                Ok(tensor) => tensor.1.to_vec(), 
-                Err(e) => return ApiResponse::internal_error(format!("Failed to extract output: {}", e)),
-            }
-        };
-
-        state.pool.push(model_arc).expect("Failed to return session to pool");
-
         let duration = start.elapsed();
-        
-        // 4. Post-processing (Filtering & NMS)
-        let decoded = crate::inference::decode_output(&result);
-        let final_boxes = crate::inference::apply_nms(decoded, 0.45);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let detection_summary = detect_with_optional_enhancement(&state, &rgb_data, timestamp);
+        let final_boxes = detection_summary.detections.clone();
         state.record_inference(&camera_name);
 
         // 5. Visual Debug Capture (Background task, non-blocking)
@@ -210,6 +174,59 @@ impl ExecuteController {
             original_h.max(1),
         );
 
+        // Persist each confirmed accident frame + metadata under debug/accidents/.
+        if !detection_summary.accident_reports.is_empty() {
+            let debug_context = serde_json::json!({
+                "vehicle_counts": vehicle_counts,
+                "congestion_levels": congestion_levels,
+                "total_vehicles": total_vehicles,
+                "timestamp": timestamp,
+                "worker_id": state.worker_id.as_str(),
+                "source": "execute_controller",
+                "dark_ratio": detection_summary.dark_ratio,
+                "used_night_enhancement": detection_summary.used_night_enhancement,
+                "max_accident_confidence": detection_summary.max_accident_confidence,
+            });
+            for report in &detection_summary.accident_reports {
+                crate::accident_debug::save_accident_snapshot(
+                    &camera_name,
+                    &original_rgb,
+                    report,
+                    &debug_context,
+                );
+            }
+        }
+
+        let has_high = congestion_levels.values().any(|level| level == "High" || level == "Severe");
+        let mut congestion_payload = None;
+        let can_alert_congestion = {
+            let mut cooldowns = state.congestion_cooldowns.write().unwrap();
+            let last_sent = cooldowns.get(&camera_name).copied().unwrap_or(0.0);
+            if has_high && (timestamp - last_sent) > 60.0 { // 1 minute
+                cooldowns.insert(camera_name.clone(), timestamp);
+                true
+            } else {
+                false
+            }
+        };
+
+        if can_alert_congestion {
+            tracing::warn!("[{}] 🚦 HIGH CONGESTION DETECTED! Including in execution response.", camera_name);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            if let Ok(_) = original_rgb.write_to(&mut buf, image::ImageOutputFormat::Jpeg(85)) {
+                let frame_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner());
+                congestion_payload = Some(serde_json::json!({
+                    "type": "congestion_alert",
+                    "camera_name": camera_name.clone(),
+                    "timestamp": timestamp,
+                    "congestion_levels": congestion_levels,
+                    "vehicle_counts": vehicle_counts,
+                    "total_vehicles": total_vehicles,
+                    "frame": frame_b64,
+                }));
+            }
+        }
+
         info!("[{}] Peak Inference completed in {}ms. Found {} detections.", camera_name, duration.as_millis(), final_boxes.len());
         
         ApiResponse::ok(serde_json::json!({
@@ -219,7 +236,52 @@ impl ExecuteController {
             "vehicle_counts": vehicle_counts,
             "congestion_levels": congestion_levels,
             "total_vehicles": total_vehicles,
-            "traffic_lights": traffic_lights
-        }))
+            "traffic_lights": traffic_lights,
+            "accidents": detection_summary.accident_reports,
+            "dark_ratio": detection_summary.dark_ratio,
+            "used_night_enhancement": detection_summary.used_night_enhancement,
+            "max_accident_confidence": detection_summary.max_accident_confidence,
+            "congestion_alert": congestion_payload
+        }))    
     }
+}
+
+fn detect_with_optional_enhancement(
+    state: &WorkerState,
+    rgb_640: &[u8],
+    timestamp: f64,
+) -> DetectionSummary {
+    let dark_ratio = crate::night_enhance::dark_ratio(rgb_640);
+    let is_night = dark_ratio >= crate::night_enhance::NIGHT_RATIO_THRESH;
+    let mut merged = run_detector(state, rgb_640);
+    let mut used_night_enhancement = false;
+
+    if is_night {
+        let enhanced = state.night_enhancer.enhance(rgb_640);
+        let enhanced_detections = run_detector(state, &enhanced);
+        if !enhanced_detections.is_empty() {
+            merged.extend(enhanced_detections);
+            merged = crate::inference::apply_nms(merged, alpen_detect::ALPEN_DETECT_NMS_IOU);
+            used_night_enhancement = true;
+        }
+    }
+
+    alpen_detect::summarize_detections(merged, timestamp, used_night_enhancement, dark_ratio)
+}
+
+fn run_detector(state: &WorkerState, rgb_640: &[u8]) -> Vec<[f32; 6]> {
+    let model_arc = loop {
+        if let Some(s) = state.pool.pop() {
+            break s;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+
+    let result = {
+        let mut model = model_arc.lock().expect("Failed to lock model session");
+        alpen_detect::run_session_augmented(&mut model, rgb_640).unwrap_or_default()
+    };
+
+    state.pool.push(model_arc).expect("Failed to return session to pool");
+    result
 }

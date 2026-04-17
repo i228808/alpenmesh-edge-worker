@@ -1,4 +1,7 @@
+use crate::alpen_detect::ALPEN_DETECT_MODEL_PATH;
 use crate::inference::RoiMap;
+use crate::night_enhance::EnlightenGanSession;
+use crate::tracker::Tracker;
 use crossbeam_queue::ArrayQueue;
 use nvml_wrapper::Nvml;
 use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
@@ -32,6 +35,32 @@ pub struct WorkerState {
     pub worker_id: Arc<String>,
     /// Local persistent secret for secure worker registry binding
     pub worker_secret: Arc<String>,
+    /// Externally reachable address of this worker's HTTP server ("host:port").
+    /// Sent in heartbeats so the scheduler can post stream assignments back.
+    pub external_addr: Arc<String>,
+    /// Base URL of the scheduler (no trailing slash), used for all upstream posts.
+    pub scheduler_url: Arc<String>,
+    /// Base URL of the economy service, used for identity registration.
+    pub economy_url: Arc<String>,
+    /// Optional night enhancement stage.
+    pub night_enhancer: Arc<EnlightenGanSession>,
+    /// Tracks cooldowns for High Congestion alerts (used by stateless /execute path).
+    /// The live stream path uses PerStreamState.congestion_cooldown_until instead.
+    pub congestion_cooldowns: Arc<RwLock<HashMap<String, f64>>>,
+    /// Per-stream state: tracker, motion hashes, cooldowns (live stream path).
+    /// Outer RwLock for stream registration; inner Mutex so one slow stream
+    /// doesn't block others.
+    pub per_stream: Arc<RwLock<HashMap<String, Arc<Mutex<PerStreamState>>>>>,
+}
+
+/// Per-stream state for the live RTSP ingestion path.
+/// Holds the IoU tracker, motion pre-filter hashes, and congestion cooldown.
+pub struct PerStreamState {
+    pub tracker: Tracker,
+    pub last_roi_hashes: HashMap<String, [u8; 64]>,
+    pub last_frame_full_hash: Option<[u8; 64]>,
+    pub congestion_cooldown_until: f64,
+    pub last_frame_idx: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -90,7 +119,10 @@ impl WorkerState {
         );
 
         for i in 0..pool_size {
-            let session = Self::create_session();
+            let mut session = Self::create_session();
+            // Run a dummy inference so TensorRT compiles and caches its engine
+            // now (at startup) rather than on the first real video frame.
+            Self::warmup_session(&mut session);
             pool.push(Arc::new(Mutex::new(session)))
                 .expect("Failed to fill session pool");
             if (i + 1) % 5 == 0 || i + 1 == pool_size {
@@ -104,6 +136,29 @@ impl WorkerState {
 
         let identity = crate::identity::load_or_create_identity()
             .expect("Failed to load/create local worker identity");
+
+        let night_enhancer = EnlightenGanSession::new();
+
+        // Externally reachable address for this worker. Defaults preserve previous
+        // behavior but multi-worker setups should set WORKER_EXTERNAL_ADDR.
+        let external_addr = std::env::var("WORKER_EXTERNAL_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1:8081".to_string());
+
+        let scheduler_url = std::env::var("SCHEDULER_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+            .trim_end_matches('/')
+            .to_string();
+
+        let economy_url = std::env::var("ECONOMY_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:3010".to_string())
+            .trim_end_matches('/')
+            .to_string();
 
         Self {
             pool: Arc::new(pool),
@@ -125,6 +180,12 @@ impl WorkerState {
                     .unwrap_or_else(|| identity.worker_id.clone()),
             ),
             worker_secret: Arc::new(identity.worker_secret),
+            external_addr: Arc::new(external_addr),
+            scheduler_url: Arc::new(scheduler_url),
+            economy_url: Arc::new(economy_url),
+            night_enhancer: Arc::new(night_enhancer),
+            congestion_cooldowns: Arc::new(RwLock::new(HashMap::new())),
+            per_stream: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -179,9 +240,10 @@ impl WorkerState {
 
         // Configuration:
         // Reserved VRAM for OS/Display: 1.5 GB (Safe margin for Windows)
-        // Average YOLOv8n footprint (weights + TRT overhead): ~250 MB
+        // Nirikshan needs substantially more VRAM than yolov8n once TensorRT caches
+        // are materialized, so keep the lane budget conservative.
         let reserved = 1536;
-        let per_session = 250;
+        let per_session = 800;
 
         if free_mb < reserved + per_session {
             return Ok(1);
@@ -192,6 +254,14 @@ impl WorkerState {
 
         // Target high parallelism for 12 cameras
         Ok(count.min(32).max(1))
+    }
+
+    /// Drive a blank 640×640 frame through the session so TensorRT compiles and
+    /// caches its engine immediately.  This trades a few seconds at startup for
+    /// near-zero latency on the first real frame.
+    fn warmup_session(session: &mut Session) {
+        let blank = vec![0u8; 640 * 640 * 3];
+        let _ = crate::alpen_detect::run_session(session, &blank);
     }
 
     fn create_session() -> Session {
@@ -212,8 +282,8 @@ impl WorkerState {
         builder
             .with_execution_providers([trt_provider.build(), cuda_provider.build()])
             .expect("GPU ENGAGEMENT FAILURE: DLLs missing or incompatible drivers.")
-            .commit_from_file("assets/yolov8n.onnx")
-            .expect("Failed to load model from assets/yolov8n.onnx")
+            .commit_from_file(ALPEN_DETECT_MODEL_PATH)
+            .expect("Failed to load model from assets/alpen_detect.onnx")
     }
 }
 

@@ -28,17 +28,18 @@ pub fn start_heartbeat_task(state: WorkerState) {
                 });
 
                 let active_streams = state.active_streams.load(Ordering::Relaxed);
-                
+
                 let payload = serde_json::json!({
-                    "id": "gpu-worker-1",
-                    "ip_address": "127.0.0.1:8081",
+                    "id": state.worker_id.as_str(),
+                    "ip_address": state.external_addr.as_str(),
                     "total_vram": state.total_vram_mb,
                     "free_vram": mem.free / 1024 / 1024,
                     "max_lanes": state.pool_size,
                     "active_streams": active_streams
                 });
 
-                match client.post("http://127.0.0.1:3000/api/v1/nodes/heartbeat")
+                let heartbeat_url = format!("{}/api/v1/nodes/heartbeat", state.scheduler_url);
+                match client.post(&heartbeat_url)
                     .json(&payload)
                     .send()
                     .await 

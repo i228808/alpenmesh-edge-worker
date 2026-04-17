@@ -1,2 +1,13 @@
 /target
 Cargo.lock
+app.worker2.yaml
+*.log
+*.py
+/debug
+.env
+eval_runs
+graphify-out
+*.json
+*.txt
+.graphify_python
+assets
